@@ -292,11 +292,6 @@ public class CosmosQueryEngine {
             return evalExpr(doc, expr.substring(1, expr.length() - 1));
         }
 
-        // NOT
-        if (expr.toUpperCase().startsWith("NOT ")) {
-            return !evalExpr(doc, expr.substring(4));
-        }
-
         // OR  (lower precedence → split first)
         int orIdx = findTopLevelKeyword(expr, "OR");
         if (orIdx >= 0) {
@@ -309,6 +304,11 @@ public class CosmosQueryEngine {
         if (andIdx >= 0) {
             return evalExpr(doc, expr.substring(0, andIdx).trim())
                     && evalExpr(doc, expr.substring(andIdx + 3).trim());
+        }
+
+        // NOT binds more tightly than AND and OR.
+        if (expr.toUpperCase().startsWith("NOT ")) {
+            return !evalExpr(doc, expr.substring(4));
         }
 
         return evalPredicate(doc, expr);
