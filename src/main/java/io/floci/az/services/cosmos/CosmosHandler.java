@@ -1186,26 +1186,21 @@ public class CosmosHandler implements AzureServiceHandler, Resettable {
         } catch (IllegalArgumentException e) {
             return errorResponse(400, "BadRequest", e.getMessage());
         }
-        CosmosQueryEngine.QueryResult result = queryEngine.execute(parsed, scopedDocs);
-
-        // ---- Pagination ----
         int maxItemCount = parseMaxItemCount(req.headers().getHeaderString("x-ms-max-item-count"));
-        int skip         = decodeContinuationToken(req.headers().getHeaderString("x-ms-continuation"));
-
-        List<Object> allItems  = result.items();
-        List<Object> pageItems = skip > 0 ? allItems.subList(Math.min(skip, allItems.size()), allItems.size())
-                                          : new ArrayList<>(allItems);
-
-        String nextToken = null;
-        if (maxItemCount > 0 && pageItems.size() > maxItemCount) {
-            nextToken = encodeContinuationToken(skip + maxItemCount);
-            pageItems = pageItems.subList(0, maxItemCount);
+        final CosmosQueryEngine.QueryContinuation continuation;
+        try {
+            continuation = decodeContinuationToken(req.headers().getHeaderString("x-ms-continuation"));
+            if (continuation != null && continuation.rid() != null
+                    && continuation.orderValues().size() != parsed.orderBy().size()) {
+                throw new IllegalArgumentException("Continuation does not match query ordering");
+            }
+        } catch (IllegalArgumentException e) {
+            return errorResponse(400, "BadRequest", e.getMessage());
         }
-
-        return queryResponse(
-                new CosmosQueryEngine.QueryResult(pageItems, pageItems.size()),
+        CosmosQueryEngine.QueryPage page = queryEngine.executePage(parsed, scopedDocs, continuation, maxItemCount);
+        return queryResponse(page.result(),
                 collRid(req.accountName(), dbId, collId),
-                nextToken);
+                encodeContinuationToken(page.continuation()));
     }
 
     private Response queryResponse(CosmosQueryEngine.QueryResult result, String rid) {
@@ -1243,23 +1238,49 @@ public class CosmosHandler implements AzureServiceHandler, Resettable {
         catch (NumberFormatException e) { return -1; }
     }
 
-    private int decodeContinuationToken(String token) {
-        if (token == null || token.isBlank()) return 0;
+    private CosmosQueryEngine.QueryContinuation decodeContinuationToken(String token) {
+        if (token == null || token.isBlank()) {
+            return null;
+        }
         try {
             String json = new String(Base64.getDecoder().decode(token), StandardCharsets.UTF_8);
             Map<?, ?> map = MAPPER.readValue(json, Map.class);
-            return ((Number) map.get("skip")).intValue();
-        } catch (Exception e) {
-            return 0;
+            if (map == null) {
+                throw new IllegalArgumentException("Invalid continuation bookmark");
+            }
+            Object skip = map.get("skip");
+            if (!(skip instanceof Integer consumed) || consumed < 0) {
+                throw new IllegalArgumentException("Invalid continuation offset");
+            }
+            Object rid = map.get("rid");
+            if (rid == null) {
+                return new CosmosQueryEngine.QueryContinuation(consumed, null, List.of());
+            }
+            if (!(rid instanceof String identity) || identity.isBlank()
+                    || !(map.get("orderValues") instanceof List<?> values)) {
+                throw new IllegalArgumentException("Invalid continuation bookmark");
+            }
+            return new CosmosQueryEngine.QueryContinuation(consumed, identity, new ArrayList<>(values));
+        } catch (IOException | IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid query continuation token", e);
         }
     }
 
-    private String encodeContinuationToken(int skip) {
-        try {
-            String json = MAPPER.writeValueAsString(Map.of("skip", skip));
-            return Base64.getEncoder().encodeToString(json.getBytes(StandardCharsets.UTF_8));
-        } catch (Exception e) {
+    private String encodeContinuationToken(CosmosQueryEngine.QueryContinuation continuation) {
+        if (continuation == null) {
             return null;
+        }
+        try {
+            Map<String, Object> bookmark = new LinkedHashMap<>();
+            bookmark.put("skip", continuation.consumed());
+            if (continuation.rid() != null) {
+                bookmark.put("rid", continuation.rid());
+                bookmark.put("orderValues", continuation.orderValues());
+            }
+            String json = MAPPER.writeValueAsString(bookmark);
+            return Base64.getEncoder().encodeToString(json.getBytes(StandardCharsets.UTF_8));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Cannot encode query continuation token", e);
         }
     }
 

@@ -27,6 +27,16 @@ keys respectively. Omitting the header permits cross-partition queries. Malforme
 Writes reject partition headers that disagree with the document body, and patches cannot change
 partition-key values. Transactional batches enforce the same rules before committing staged writes.
 
+Query continuation tokens bookmark the last source document and its `ORDER BY` values, including
+a stable identity to distinguish equal sort values. Deleting an already consumed page, including
+through transactional batches, does not skip remaining documents. This also applies to projections
+that omit the sort fields or return scalar values. `TOP` and `OFFSET ... LIMIT` retain their total
+query limits across pages. Tokens are stateless; no server-side query session is required.
+
+Pagination does not provide snapshot isolation for concurrent inserts or changes to sort values.
+Aggregate, `GROUP BY`, and `DISTINCT` queries retain the emulator's existing result-offset pagination;
+the document bookmark guarantee applies to queries without aggregation or deduplication.
+
 ### .NET query planner configuration
 
 The account response advertises query-engine capabilities. Floci-AZ emits 20 keys, while the

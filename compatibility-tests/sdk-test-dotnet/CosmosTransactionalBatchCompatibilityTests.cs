@@ -11,6 +11,84 @@ public sealed class CosmosTransactionalBatchCompatibilityTests
         Environment.GetEnvironmentVariable("FLOCI_AZ_ENDPOINT") ?? "http://localhost:4577";
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    [Timeout(60_000)]
+    public async Task QueryContinuesAfterDeletingEachPage(bool ordered, CancellationToken cancellationToken)
+    {
+        using CosmosClient client = CreateClient($"dotnetpurge{Guid.NewGuid():N}");
+        Database database = await client.CreateDatabaseAsync(
+            $"db-{Guid.NewGuid():N}", cancellationToken: cancellationToken);
+        try
+        {
+            Container container = await database.CreateContainerAsync(
+                new ContainerProperties("items", "/tenant"), cancellationToken: cancellationToken);
+            string[] expected = Enumerable.Range(0, 7).Select(i => $"item-{i}").ToArray();
+            for (int i = 0; i < expected.Length; i++)
+            {
+                await container.CreateItemAsync(new { id = expected[i], tenant = "target", rank = i / 3 },
+                    new PartitionKey("target"), cancellationToken: cancellationToken);
+                await container.CreateItemAsync(new { id = expected[i], tenant = "other", rank = i / 3 },
+                    new PartitionKey("other"), cancellationToken: cancellationToken);
+            }
+
+            string sql = "SELECT c.id FROM c" + (ordered ? " ORDER BY c.rank DESC" : "");
+            var options = new QueryRequestOptions { PartitionKey = new PartitionKey("target"), MaxItemCount = 2 };
+            using FeedIterator<JObject> iterator = container.GetItemQueryIterator<JObject>(sql, requestOptions: options);
+            var visited = new List<string>();
+            int pages = 0;
+            while (iterator.HasMoreResults)
+            {
+                FeedResponse<JObject> page = await iterator.ReadNextAsync(cancellationToken);
+                if (++pages > 7)
+                {
+                    throw new InvalidOperationException("Query continuation did not terminate");
+                }
+                if (page.Count == 0)
+                {
+                    continue;
+                }
+                await Assert.That(page.Count <= 2).IsTrue();
+                TransactionalBatch batch = container.CreateTransactionalBatch(new PartitionKey("target"));
+                foreach (JObject item in page)
+                {
+                    string id = item.Value<string>("id")!;
+                    visited.Add(id);
+                    batch.DeleteItem(id);
+                }
+                using TransactionalBatchResponse deleted = await batch.ExecuteAsync(cancellationToken);
+                await Assert.That(deleted.IsSuccessStatusCode).IsTrue();
+                await Assert.That(deleted.Count).IsEqualTo(page.Count);
+                for (int i = 0; i < deleted.Count; i++)
+                {
+                    await Assert.That(deleted[i].StatusCode).IsEqualTo(HttpStatusCode.NoContent);
+                }
+            }
+
+            await Assert.That(visited).IsEquivalentTo(expected);
+            using FeedIterator<JObject> remaining = container.GetItemQueryIterator<JObject>(
+                "SELECT c.id FROM c", requestOptions: options);
+            while (remaining.HasMoreResults)
+            {
+                await Assert.That((await remaining.ReadNextAsync(cancellationToken)).Count).IsEqualTo(0);
+            }
+            using FeedIterator<JObject> other = container.GetItemQueryIterator<JObject>(
+                "SELECT c.id FROM c",
+                requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey("other") });
+            var preserved = new List<string>();
+            while (other.HasMoreResults)
+            {
+                preserved.AddRange((await other.ReadNextAsync(cancellationToken)).Select(item => item.Value<string>("id")!));
+            }
+            await Assert.That(preserved).IsEquivalentTo(expected);
+        }
+        finally
+        {
+            await database.DeleteAsync(cancellationToken: cancellationToken);
+        }
+    }
+
+    [Test]
     [Timeout(60_000)]
     public async Task DotnetSdkExecutesTransactionalBatches(CancellationToken cancellationToken)
     {
